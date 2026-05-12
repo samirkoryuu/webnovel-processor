@@ -10,29 +10,30 @@ const supabase = createClient(
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-// Safely extract __NEXT_DATA__ JSON from HTML (handles raw or escaped)
-function extractNextData(htmlOrEscaped) {
-    let rawHtml = htmlOrEscaped;
-    // If it looks like a JSON-escaped string (starts with quotes and has \")
-    if (typeof rawHtml === 'string' && (rawHtml.startsWith('"') || rawHtml.includes('\\"'))) {
+// Extract __NEXT_DATA__ from HTML (with fallbacks)
+function extractNextData(rawHtml) {
+    // If rawHtml is a string that looks like a JSON object, parse it first
+    if (typeof rawHtml === 'string' && (rawHtml.trim().startsWith('{') || rawHtml.trim().startsWith('"'))) {
         try {
-            rawHtml = JSON.parse(rawHtml); // unescape
-        } catch(e) { /* not valid JSON, keep as is */ }
+            const parsed = JSON.parse(rawHtml);
+            if (parsed.content) rawHtml = parsed.content;
+            else if (parsed.html) rawHtml = parsed.html;
+            else if (typeof parsed === 'string') rawHtml = parsed;
+        } catch(e) {}
     }
-    
-    // Method 1: use cheerio to find the script tag
+
+    // Use cheerio to find __NEXT_DATA__
     try {
         const $ = cheerio.load(rawHtml);
         const script = $('#__NEXT_DATA__').html();
         if (script) return JSON.parse(script);
-    } catch(e) { console.log('Cheerio failed, trying regex...'); }
-    
-    // Method 2: regex fallback (more robust for malformed HTML)
+    } catch(e) { /* fall through to regex */ }
+
+    // Regex fallback
     const regex = /<script\s+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i;
     const match = rawHtml.match(regex);
-    if (match && match[1]) {
-        return JSON.parse(match[1]);
-    }
+    if (match && match[1]) return JSON.parse(match[1]);
+
     throw new Error('__NEXT_DATA__ not found');
 }
 
@@ -44,12 +45,9 @@ function extractBooksFromHTML(html, taskId) {
     const base = profile.baseInfo;
     const books = props.authorPageInfo?.[userId]?.bookListItems || [];
 
-    const penname = base.realName;
-    const country = base.countryName || null;
-
     return books.map(book => ({
-        penname,
-        country,
+        penname: base.realName,
+        country: base.countryName || null,
         book: book.bookName,
         genre: book.categoryName || null,
         collections: book.collectionNum || 0,
@@ -71,10 +69,9 @@ async function upsertBooks(books) {
 }
 
 async function processCompletedTasks() {
-    // Fetch full result object (not just ->content)
     const { data: tasks, error } = await supabase
         .from('task_queue')
-        .select('id, result')   // ✅ get the whole JSONB object
+        .select('id, result')
         .eq('status', 'completed')
         .eq('processed', false)
         .order('id', { ascending: true })
@@ -88,31 +85,43 @@ async function processCompletedTasks() {
 
     for (const task of tasks) {
         try {
-            // Extract HTML from the JSONB object
-            const html = task.result?.content;
+            // Extract HTML from result – result can be object or string
+            let html = null;
+            if (task.result && typeof task.result === 'object') {
+                html = task.result.content || task.result.html || null;
+            } else if (typeof task.result === 'string') {
+                // Might be a JSON string or plain HTML
+                try {
+                    const parsed = JSON.parse(task.result);
+                    html = parsed.content || parsed.html || null;
+                } catch(e) {
+                    // Not JSON, treat as raw HTML
+                    html = task.result;
+                }
+            }
+
             if (!html) {
-                console.log(`⚠️ Task ${task.id}: no 'content' field in result, marking as processed`);
+                console.log(`⚠️ Task ${task.id}: no HTML content found, marking as processed`);
                 await supabase.from('task_queue').update({ processed: true }).eq('id', task.id);
                 continue;
             }
+
             const books = extractBooksFromHTML(html, task.id);
             if (books.length) {
                 await upsertBooks(books);
                 console.log(`✅ Task ${task.id}: processed ${books.length} books`);
             } else {
-                console.log(`⚠️ Task ${task.id}: no books found (but HTML was present)`);
+                console.log(`⚠️ Task ${task.id}: HTML parsed but no books found`);
             }
-            await supabase
-                .from('task_queue')
-                .update({ processed: true })
-                .eq('id', task.id);
+            await supabase.from('task_queue').update({ processed: true }).eq('id', task.id);
         } catch (err) {
             console.error(`❌ Task ${task.id} failed:`, err.message);
-            // Do NOT mark as processed – will retry
+            // Do NOT mark processed – will retry
         }
     }
 }
 
+// Run every 5 seconds
 setInterval(processCompletedTasks, 5000);
 processCompletedTasks();
 
