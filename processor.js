@@ -71,10 +71,10 @@ async function upsertBooks(books) {
 }
 
 async function processCompletedTasks() {
-    // Extract the 'content' field from the JSONB result column
+    // Fetch full result object (not just ->content)
     const { data: tasks, error } = await supabase
         .from('task_queue')
-        .select('id, result->>content as html')   // 👈 key change
+        .select('id, result')   // ✅ get the whole JSONB object
         .eq('status', 'completed')
         .eq('processed', false)
         .order('id', { ascending: true })
@@ -88,18 +88,19 @@ async function processCompletedTasks() {
 
     for (const task of tasks) {
         try {
-            // task.html is the raw HTML string (may be null if missing)
-            if (!task.html) {
-                console.log(`⚠️ Task ${task.id}: no content field, marking as processed`);
+            // Extract HTML from the JSONB object
+            const html = task.result?.content;
+            if (!html) {
+                console.log(`⚠️ Task ${task.id}: no 'content' field in result, marking as processed`);
                 await supabase.from('task_queue').update({ processed: true }).eq('id', task.id);
                 continue;
             }
-            const books = extractBooksFromHTML(task.html, task.id);
+            const books = extractBooksFromHTML(html, task.id);
             if (books.length) {
                 await upsertBooks(books);
                 console.log(`✅ Task ${task.id}: processed ${books.length} books`);
             } else {
-                console.log(`⚠️ Task ${task.id}: no books found`);
+                console.log(`⚠️ Task ${task.id}: no books found (but HTML was present)`);
             }
             await supabase
                 .from('task_queue')
