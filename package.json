@@ -1,0 +1,10 @@
+{
+  "name": "webnovel-processor",
+  "version": "1.0.0",
+  "main": "processor.js",
+  "scripts": { "start": "node processor.js" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "cheerio": "^1.0.0-rc.12"
+  }
+}
