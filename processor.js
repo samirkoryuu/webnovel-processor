@@ -10,7 +10,7 @@ const supabase = createClient(
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-// Safely extract __NEXT_DATA__ JSON from HTML (escaped or raw)
+// Safely extract __NEXT_DATA__ JSON from HTML (handles raw or escaped)
 function extractNextData(htmlOrEscaped) {
     let rawHtml = htmlOrEscaped;
     // If it looks like a JSON-escaped string (starts with quotes and has \")
@@ -71,9 +71,10 @@ async function upsertBooks(books) {
 }
 
 async function processCompletedTasks() {
+    // Extract the 'content' field from the JSONB result column
     const { data: tasks, error } = await supabase
         .from('task_queue')
-        .select('id, result')
+        .select('id, result->>content as html')   // 👈 key change
         .eq('status', 'completed')
         .eq('processed', false)
         .order('id', { ascending: true })
@@ -87,7 +88,13 @@ async function processCompletedTasks() {
 
     for (const task of tasks) {
         try {
-            const books = extractBooksFromHTML(task.result, task.id);
+            // task.html is the raw HTML string (may be null if missing)
+            if (!task.html) {
+                console.log(`⚠️ Task ${task.id}: no content field, marking as processed`);
+                await supabase.from('task_queue').update({ processed: true }).eq('id', task.id);
+                continue;
+            }
+            const books = extractBooksFromHTML(task.html, task.id);
             if (books.length) {
                 await upsertBooks(books);
                 console.log(`✅ Task ${task.id}: processed ${books.length} books`);
