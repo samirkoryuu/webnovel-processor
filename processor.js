@@ -3,60 +3,60 @@ const { createClient } = require('@supabase/supabase-js');
 const cheerio = require('cheerio');
 
 const app = express();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
+// Extract __NEXT_DATA__ using regex only (cheerio truncates large scripts)
 function extractNextData(rawHtml) {
-    console.log('extractNextData called, HTML length:', rawHtml?.length);
-    console.log('First 300 chars:', rawHtml?.substring(0, 300));
-    
-    // If rawHtml is a string that looks like JSON object, parse it first
+    // If rawHtml is a JSON-wrapped string, unwrap it
     if (typeof rawHtml === 'string' && (rawHtml.trim().startsWith('{') || rawHtml.trim().startsWith('"'))) {
         try {
             const parsed = JSON.parse(rawHtml);
             if (parsed.content) rawHtml = parsed.content;
             else if (parsed.html) rawHtml = parsed.html;
             else if (typeof parsed === 'string') rawHtml = parsed;
-        } catch(e) { console.log('Failed to parse top-level JSON:', e.message); }
+        } catch(e) { /* not JSON, keep as is */ }
     }
 
-    // Use cheerio to find __NEXT_DATA__
-    try {
-        const $ = cheerio.load(rawHtml);
-        const script = $('#__NEXT_DATA__').html();
-        if (script) {
-            console.log('Found __NEXT_DATA__ via cheerio, length:', script.length);
-            return JSON.parse(script);
-        }
-    } catch(e) { console.log('Cheerio failed:', e.message); }
-
-    // Regex fallback
+    // Extract the entire script content using regex (no truncation)
     const regex = /<script\s+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i;
     const match = rawHtml.match(regex);
-    if (match && match[1]) {
-        console.log('Found __NEXT_DATA__ via regex, length:', match[1].length);
-        return JSON.parse(match[1]);
-    }
+    if (!match || !match[1]) throw new Error('__NEXT_DATA__ script not found');
 
-    throw new Error('__NEXT_DATA__ not found');
+    const scriptContent = match[1];
+    // Optional: log length to verify
+    // console.log('Script content length:', scriptContent.length);
+    return JSON.parse(scriptContent);
 }
 
 function extractBooksFromHTML(html, taskId) {
     const data = extractNextData(html);
-    console.log('data keys:', Object.keys(data));
     const props = data.props;
     if (!props) throw new Error('props missing');
-    console.log('props keys:', Object.keys(props));
     const initialState = props.initialState;
     if (!initialState) throw new Error('initialState missing');
-    console.log('initialState keys:', Object.keys(initialState));
-    const userProfile = initialState.userProfile;
-    if (!userProfile) throw new Error('userProfile missing');
+
+    // Find userProfile and authorPageInfo – they may be at top level or inside entities
+    let userProfile = initialState.userProfile;
+    let authorPageInfo = initialState.authorPageInfo;
+    if (!userProfile || !authorPageInfo) {
+        // Fallback: search inside entities (structure may vary)
+        if (initialState.entities) {
+            if (!userProfile) userProfile = initialState.entities.userProfile;
+            if (!authorPageInfo) authorPageInfo = initialState.entities.authorPageInfo;
+        }
+    }
+    if (!userProfile) throw new Error('userProfile not found');
+    if (!authorPageInfo) throw new Error('authorPageInfo not found');
+
     const userId = Object.keys(userProfile)[0];
     const profile = userProfile[userId];
     const base = profile.baseInfo;
-    const books = initialState.authorPageInfo?.[userId]?.bookListItems || [];
+    const books = authorPageInfo[userId]?.bookListItems || [];
 
     return books.map(book => ({
         penname: base.realName,
@@ -90,32 +90,25 @@ async function processCompletedTasks() {
         .order('id', { ascending: true })
         .limit(10);
 
-    if (error) {
-        console.error('Fetch error:', error.message);
-        return;
-    }
-    if (!tasks || tasks.length === 0) return;
+    if (error || !tasks?.length) return;
 
     for (const task of tasks) {
         try {
-            // Extract HTML from result
+            // Extract HTML from result (handles both JSONB object and string)
             let html = null;
             if (task.result && typeof task.result === 'object') {
-                html = task.result.content || task.result.html || null;
-                console.log(`Task ${task.id}: result object, found content = ${!!html}`);
+                html = task.result.content || task.result.html;
             } else if (typeof task.result === 'string') {
                 try {
                     const parsed = JSON.parse(task.result);
-                    html = parsed.content || parsed.html || null;
-                    console.log(`Task ${task.id}: parsed string, found content = ${!!html}`);
+                    html = parsed.content || parsed.html;
                 } catch(e) {
                     html = task.result;
-                    console.log(`Task ${task.id}: treating as raw string`);
                 }
             }
 
             if (!html) {
-                console.log(`⚠️ Task ${task.id}: no HTML content found, marking as processed`);
+                console.log(`⚠️ Task ${task.id}: no HTML content found`);
                 await supabase.from('task_queue').update({ processed: true }).eq('id', task.id);
                 continue;
             }
@@ -125,13 +118,12 @@ async function processCompletedTasks() {
                 await upsertBooks(books);
                 console.log(`✅ Task ${task.id}: processed ${books.length} books`);
             } else {
-                console.log(`⚠️ Task ${task.id}: HTML parsed but no books found`);
+                console.log(`⚠️ Task ${task.id}: no books found`);
             }
             await supabase.from('task_queue').update({ processed: true }).eq('id', task.id);
         } catch (err) {
             console.error(`❌ Task ${task.id} failed:`, err.message);
-            console.error(err.stack);
-            // Do NOT mark processed – will retry
+            // Do NOT mark processed – retry later
         }
     }
 }
