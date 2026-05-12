@@ -3,47 +3,60 @@ const { createClient } = require('@supabase/supabase-js');
 const cheerio = require('cheerio');
 
 const app = express();
-const supabase = createClient(
-    process.env.SUPABASE_URL,
-    process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-// Extract __NEXT_DATA__ from HTML (with fallbacks)
 function extractNextData(rawHtml) {
-    // If rawHtml is a string that looks like a JSON object, parse it first
+    console.log('extractNextData called, HTML length:', rawHtml?.length);
+    console.log('First 300 chars:', rawHtml?.substring(0, 300));
+    
+    // If rawHtml is a string that looks like JSON object, parse it first
     if (typeof rawHtml === 'string' && (rawHtml.trim().startsWith('{') || rawHtml.trim().startsWith('"'))) {
         try {
             const parsed = JSON.parse(rawHtml);
             if (parsed.content) rawHtml = parsed.content;
             else if (parsed.html) rawHtml = parsed.html;
             else if (typeof parsed === 'string') rawHtml = parsed;
-        } catch(e) {}
+        } catch(e) { console.log('Failed to parse top-level JSON:', e.message); }
     }
 
     // Use cheerio to find __NEXT_DATA__
     try {
         const $ = cheerio.load(rawHtml);
         const script = $('#__NEXT_DATA__').html();
-        if (script) return JSON.parse(script);
-    } catch(e) { /* fall through to regex */ }
+        if (script) {
+            console.log('Found __NEXT_DATA__ via cheerio, length:', script.length);
+            return JSON.parse(script);
+        }
+    } catch(e) { console.log('Cheerio failed:', e.message); }
 
     // Regex fallback
     const regex = /<script\s+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i;
     const match = rawHtml.match(regex);
-    if (match && match[1]) return JSON.parse(match[1]);
+    if (match && match[1]) {
+        console.log('Found __NEXT_DATA__ via regex, length:', match[1].length);
+        return JSON.parse(match[1]);
+    }
 
     throw new Error('__NEXT_DATA__ not found');
 }
 
 function extractBooksFromHTML(html, taskId) {
     const data = extractNextData(html);
-    const props = data.props.initialState;
-    const userId = Object.keys(props.userProfile)[0];
-    const profile = props.userProfile[userId];
+    console.log('data keys:', Object.keys(data));
+    const props = data.props;
+    if (!props) throw new Error('props missing');
+    console.log('props keys:', Object.keys(props));
+    const initialState = props.initialState;
+    if (!initialState) throw new Error('initialState missing');
+    console.log('initialState keys:', Object.keys(initialState));
+    const userProfile = initialState.userProfile;
+    if (!userProfile) throw new Error('userProfile missing');
+    const userId = Object.keys(userProfile)[0];
+    const profile = userProfile[userId];
     const base = profile.baseInfo;
-    const books = props.authorPageInfo?.[userId]?.bookListItems || [];
+    const books = initialState.authorPageInfo?.[userId]?.bookListItems || [];
 
     return books.map(book => ({
         penname: base.realName,
@@ -85,18 +98,19 @@ async function processCompletedTasks() {
 
     for (const task of tasks) {
         try {
-            // Extract HTML from result – result can be object or string
+            // Extract HTML from result
             let html = null;
             if (task.result && typeof task.result === 'object') {
                 html = task.result.content || task.result.html || null;
+                console.log(`Task ${task.id}: result object, found content = ${!!html}`);
             } else if (typeof task.result === 'string') {
-                // Might be a JSON string or plain HTML
                 try {
                     const parsed = JSON.parse(task.result);
                     html = parsed.content || parsed.html || null;
+                    console.log(`Task ${task.id}: parsed string, found content = ${!!html}`);
                 } catch(e) {
-                    // Not JSON, treat as raw HTML
                     html = task.result;
+                    console.log(`Task ${task.id}: treating as raw string`);
                 }
             }
 
@@ -116,14 +130,14 @@ async function processCompletedTasks() {
             await supabase.from('task_queue').update({ processed: true }).eq('id', task.id);
         } catch (err) {
             console.error(`❌ Task ${task.id} failed:`, err.message);
+            console.error(err.stack);
             // Do NOT mark processed – will retry
         }
     }
 }
 
-// Run every 5 seconds
 setInterval(processCompletedTasks, 5000);
 processCompletedTasks();
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Processor running on port ${PORT}`));
